@@ -8,6 +8,7 @@
 
 推荐流 · 点击即播 · 实时弹幕 · DASH 1080P · 扫码登录 · 历史同步 · 状态持久化 · 0 Token
 
+[![npm](https://img.shields.io/npm/v/dsh-bili-mini?style=flat-square)](https://www.npmjs.com/package/dsh-bili-mini)
 [![DSH Plugin](https://img.shields.io/badge/DSH-Plugin-6C5CE7?style=flat-square)](https://github.com/deepseek-ai/deepseek-harness)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-00AEEC?style=flat-square)](#平台支持)
 [![License](https://img.shields.io/badge/license-MIT-2ea44f?style=flat-square)](LICENSE)
@@ -63,20 +64,40 @@ BiliMini 是一个面向 [DeepSeek Harness](https://github.com/deepseek-ai/deeps
 
 ## 安装
 
-### 从 GitHub 安装（推荐）
+### 从 npm 安装（推荐）
 
 ```bash
-dsh plugin add https://github.com/tuanzhanghao/dsh-bili-mini
+dsh plugin add dsh-bili-mini
+```
+
+如果你的 DSH 版本要求显式 npm spec：
+
+```bash
+dsh plugin add npm:dsh-bili-mini
 ```
 
 如果你的 DSH 使用显式 profile：
 
 ```bash
 # 桌面版通常使用 desktop
-dsh plugin --profile desktop add https://github.com/tuanzhanghao/dsh-bili-mini
+dsh plugin --profile desktop add dsh-bili-mini
 
 # Web 版
-dsh plugin --profile web add https://github.com/tuanzhanghao/dsh-bili-mini
+dsh plugin --profile web add dsh-bili-mini
+```
+
+也可以先检查 npm 包内容：
+
+```bash
+npm view dsh-bili-mini
+```
+
+安装后**完整退出并重新打开 DSH**，然后在侧边栏打开 **BiliMini**。
+
+### 从 GitHub 安装（源码）
+
+```bash
+dsh plugin add https://github.com/tuanzhanghao/dsh-bili-mini
 ```
 
 部分 DSH 版本也接受 GitHub 简写：
@@ -84,8 +105,6 @@ dsh plugin --profile web add https://github.com/tuanzhanghao/dsh-bili-mini
 ```bash
 dsh plugin add github:tuanzhanghao/dsh-bili-mini
 ```
-
-安装后**完整退出并重新打开 DSH**，然后在侧边栏打开 **BiliMini**。
 
 > Host 代码更新后需要完整重启，而不是只刷新网页。从源码安装时，如果 pnpm 询问 `allowBuilds`：本项目没有构建脚本、原生依赖或 `postinstall`，只在你信任本仓库时授权。
 

@@ -1,9 +1,9 @@
 {
   "name": "dsh-bili-mini",
-  "version": "0.1.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
-  "description": "BiliMini — a geeky Bilibili sidebar for DeepSeek Harness (DSH).",
+  "main": "./index.js",
+  "description": "BiliMini — a geeky Bilibili sidebar for DeepSeek Harness (DSH) with DASH 1080P, danmaku and local QR login.",
   "icon": "./icon.svg",
   "exports": {
     ".": "./index.js",
@@ -38,7 +38,7 @@
   "author": "tuanzhanghao",
   "repository": {
     "type": "git",
-    "url": "https://github.com/tuanzhanghao/dsh-bili-mini.git"
+    "url": "git+https://github.com/tuanzhanghao/dsh-bili-mini.git"
   },
   "homepage": "https://github.com/tuanzhanghao/dsh-bili-mini#readme",
   "bugs": {
@@ -47,11 +47,24 @@
   "keywords": [
     "dsh",
     "dsh-plugin",
+    "deepseek-harness",
     "bilibili",
+    "bilibili-plugin",
     "danmaku",
-    "artplayer"
+    "dash",
+    "dashjs",
+    "artplayer",
+    "electron",
+    "sidebar"
   ],
   "engines": {
     "node": ">=20"
+  },
+  "scripts": {
+    "check": "node --check index.js && node --check bili.js && node --check auth.js && node --check danmaku.js && node --check client.js",
+    "prepublishOnly": "npm run check"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
