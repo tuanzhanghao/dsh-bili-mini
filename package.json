@@ -1,0 +1,57 @@
+{
+  "name": "dsh-bili-mini",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "BiliMini — a geeky Bilibili sidebar for DeepSeek Harness (DSH).",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "bili.js",
+    "danmaku.js",
+    "auth.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "vendor/",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "license": "MIT",
+  "author": "tuanzhanghao",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tuanzhanghao/dsh-bili-mini.git"
+  },
+  "homepage": "https://github.com/tuanzhanghao/dsh-bili-mini#readme",
+  "bugs": {
+    "url": "https://github.com/tuanzhanghao/dsh-bili-mini/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "bilibili",
+    "danmaku",
+    "artplayer"
+  ],
+  "engines": {
+    "node": ">=20"
+  }
+}

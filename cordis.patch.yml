@@ -1,0 +1,6 @@
+- insert:
+    - id: dsh-bili-mini
+      name: 'dsh-bili-mini'
+      config:
+        feedSize: 12
+        cacheTtlMs: 60000

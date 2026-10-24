@@ -1,0 +1,23 @@
+# dependencies (the project has none at runtime, but keep this for tooling)
+node_modules/
+
+# local login session, caches and temporary files
+data/
+cookie.json
+*.tmp
+
+# OS / editor clutter
+.DS_Store
+Thumbs.db
+desktop.ini
+.dsh-ops/
+.idea/
+.vscode/
+
+# local environment overrides
+.env
+.env.*
+!.env.example
+
+# logs
+*.log
