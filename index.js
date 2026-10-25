@@ -5,7 +5,9 @@
  *   GET  /bili-mini/api/feed?refresh=1&...   recommendation list
  *   GET  /bili-mini/api/history                latest 30 watch-history entries
  *   POST /bili-mini/api/history/report         report playback progress (silent on failure)
- *   GET  /bili-mini/api/play?bvid=...&cid=... play metadata + proxied stream + danmaku
+ *   GET  /bili-mini/api/play?contentKey=...&cid=...
+ *                                              play metadata + proxied stream + danmaku
+ *                                              (legacy ?bvid=... and ?epid=... still work)
  *   GET  /bili-mini/stream/<token>            range-aware media proxy
  *   GET  /bili-mini/api/login/qr              Bilibili QR code + qrcode_key
  *   GET  /bili-mini/api/login/poll?key=...    scan status (writes cookie on success)
@@ -30,8 +32,12 @@ import {
   fetchHistory,
   fetchPlayUrl,
   fetchMp4PlayUrl,
+  fetchPgcPlayUrl,
+  fetchPgcSeason,
   fetchRecommendations,
   fetchVideoView,
+  parseContentKey,
+  reportPgcHistory,
   reportVideoHistory,
 } from './bili.js';
 import { fetchDanmaku } from './danmaku.js';
@@ -215,7 +221,101 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  async function loadPlay(bvid, requestedCid, force, options = {}) {
+  /**
+   * Build the DASH response shared by UGC (logged in) and PGC (either login
+   * state). This is a pure move of the previous inline UGC block; the field
+   * set and order of fallbacks are unchanged.
+   */
+  function buildDashPlayData({ baseData, play, qn, requestedQn }) {
+    const videoTrack = selectDashVideo(play.dash, qn);
+    const audioTrack = selectDashAudio(play.dash);
+    if (!videoTrack || !audioTrack) {
+      throw new Error('B 站没有返回可播放的 DASH 流');
+    }
+    if (
+      !videoTrack.initRange ||
+      !videoTrack.indexRange ||
+      !audioTrack.initRange ||
+      !audioTrack.indexRange
+    ) {
+      throw new Error('B 站 DASH 流缺少 SegmentBase 范围');
+    }
+
+    const videoUrl = rememberStream(
+      videoTrack.baseUrl,
+      videoTrack.mimeType || 'video/mp4',
+    );
+    const audioUrl = rememberStream(
+      audioTrack.baseUrl,
+      audioTrack.mimeType || 'audio/mp4',
+    );
+    const dashDuration = play.dash.duration || baseData.duration || 0;
+    const manifestXml = buildDashManifest({
+      duration: dashDuration,
+      minBufferTime: play.dash.minBufferTime,
+      video: videoTrack,
+      audio: audioTrack,
+      videoUrl,
+      audioUrl,
+    });
+    const manifestUrl = rememberDashManifest(manifestXml);
+    const availableQualities = listAvailableQualities(play.dash);
+
+    return {
+      ...baseData,
+      mode: 'dash',
+      manifest: {
+        url: manifestUrl,
+        mime: 'application/dash+xml',
+      },
+      quality: videoTrack.id,
+      qualityLabel: qualityLabel(videoTrack.id),
+      qualityLocked: requestedQn > 64,
+      availableQualities,
+      acceptQuality: play.acceptQuality,
+      acceptDescription: play.acceptDescription,
+      dashDuration: Number(dashDuration) || 0,
+      format: 'dash',
+    };
+  }
+
+  /**
+   * Build the progressive-MP4 response used by anonymous UGC playback. Pure
+   * move of the previous inline block.
+   */
+  function buildMp4PlayData({ baseData, play, requestedQn }) {
+    const segment = play.segments?.[0];
+    if (!segment) throw new Error('B 站没有返回可播放的视频流');
+    const availableQualities = [
+      ...new Set([play.quality, ...play.acceptQuality]),
+    ]
+      .filter(
+        (quality) =>
+          quality > 0 &&
+          (SUPPORTED_QN.has(quality) || quality === play.quality),
+      )
+      .sort((a, b) => b - a)
+      .map((quality) => ({ qn: quality, label: qualityLabel(quality) }));
+
+    return {
+      ...baseData,
+      mode: 'mp4',
+      stream: {
+        url: rememberStream(segment.url, 'video/mp4'),
+        size: segment.size,
+        durationMs: segment.durationMs,
+      },
+      quality: play.quality,
+      qualityLabel: qualityLabel(play.quality),
+      qualityLocked: requestedQn > 64,
+      availableQualities,
+      acceptQuality: play.acceptQuality,
+      acceptDescription: play.acceptDescription,
+      format: play.format,
+    };
+  }
+
+  async function loadPlay(contentKey, requestedCid, force, options = {}) {
     const {
       qn = 64,
       requestedQn = qn,
@@ -223,24 +323,67 @@ export function apply(ctx, config = {}) {
       loggedIn = false,
       sessionKey = 'anon',
     } = options;
-    const key = `${sessionKey}:${bvid}:${requestedCid || 0}:${qn}`;
+    const parsed = parseContentKey(contentKey);
+    if (!parsed) throw new Error('invalid contentKey');
+    const key = `${sessionKey}:${parsed.contentKey}:${requestedCid || 0}:${qn}`;
     const hit = playCache.get(key);
     if (!force && hit && Date.now() - hit.at < PLAY_CACHE_TTL_MS) {
       return { ...hit.data, cached: true };
     }
     if (force) playCache.delete(key);
 
-    const view = await fetchVideoView(bvid);
-    if (!view.cid) throw new Error('没有找到该视频的 cid');
+    let cid = 0;
+    let aid = 0;
+    let title = '';
+    let duration = 0;
+    let cover = '';
+    let owner = { name: '' };
+    let seasonId = 0;
+    let seasonTitle = '';
+    let episodes = [];
+    let playPromise;
 
-    const page = requestedCid > 0
-      ? view.pages.find((entry) => entry.cid === requestedCid)
-      : undefined;
-    const cid = page?.cid ?? view.cid;
+    if (parsed.kind === 'pgc') {
+      const season = await fetchPgcSeason(parsed.epid, { cookies });
+      const episode = season.episode;
+      cid = episode.cid;
+      aid = episode.aid;
+      title =
+        [season.title, episode.title].filter(Boolean).join(' · ') ||
+        episode.title ||
+        '番剧';
+      duration = episode.duration || 0;
+      cover = episode.cover || season.cover;
+      owner = season.owner;
+      seasonId = season.seasonId;
+      seasonTitle = season.title;
+      // Keep the selector DTO small: the season payload also carries aid,
+      // bvid, covers and publish times that the episode picker does not need.
+      episodes = season.episodes.map((entry) => ({
+        epid: entry.epid,
+        cid: entry.cid,
+        title: entry.title,
+        duration: entry.duration,
+      }));
+      playPromise = fetchPgcPlayUrl(parsed.epid, cid, { qn, cookies });
+    } else {
+      const view = await fetchVideoView(parsed.bvid);
+      if (!view.cid) throw new Error('没有找到该视频的 cid');
 
-    const playPromise = loggedIn
-      ? fetchPlayUrl(bvid, cid, { qn, cookies })
-      : fetchMp4PlayUrl(bvid, cid, { qn: 64, cookies: null });
+      const page = requestedCid > 0
+        ? view.pages.find((entry) => entry.cid === requestedCid)
+        : undefined;
+      cid = page?.cid ?? view.cid;
+      aid = view.aid;
+      title = page?.part || view.title;
+      duration = page?.duration || view.duration;
+      cover = view.cover;
+      owner = view.owner;
+      playPromise = loggedIn
+        ? fetchPlayUrl(parsed.bvid, cid, { qn, cookies })
+        : fetchMp4PlayUrl(parsed.bvid, cid, { qn: 64, cookies: null });
+    }
+
     const [play, danmaku] = await Promise.all([
       playPromise,
       fetchDanmaku(cid, { limit: 1000, timeoutMs: 4000 })
@@ -254,14 +397,22 @@ export function apply(ctx, config = {}) {
       );
     }
 
+    if (parsed.kind === 'pgc' && !duration) {
+      duration = Number(play.duration) || 0;
+    }
+
     const baseData = {
-      aid: view.aid,
-      bvid,
+      kind: parsed.kind,
+      contentKey: parsed.contentKey,
+      aid,
+      ...(parsed.kind === 'ugc'
+        ? { bvid: parsed.bvid }
+        : { epid: parsed.epid, seasonId, seasonTitle, episodes }),
       cid,
-      title: page?.part || view.title,
-      duration: page?.duration || view.duration,
-      cover: view.cover,
-      owner: view.owner,
+      title,
+      duration,
+      cover,
+      owner,
       requestedQn,
       qn,
       loggedIn,
@@ -271,90 +422,10 @@ export function apply(ctx, config = {}) {
     };
 
     let data;
-    if (loggedIn) {
-      const videoTrack = selectDashVideo(play.dash, qn);
-      const audioTrack = selectDashAudio(play.dash);
-      if (!videoTrack || !audioTrack) {
-        throw new Error('B 站没有返回可播放的 DASH 流');
-      }
-      if (
-        !videoTrack.initRange ||
-        !videoTrack.indexRange ||
-        !audioTrack.initRange ||
-        !audioTrack.indexRange
-      ) {
-        throw new Error('B 站 DASH 流缺少 SegmentBase 范围');
-      }
-
-      const videoUrl = rememberStream(
-        videoTrack.baseUrl,
-        videoTrack.mimeType || 'video/mp4',
-      );
-      const audioUrl = rememberStream(
-        audioTrack.baseUrl,
-        audioTrack.mimeType || 'audio/mp4',
-      );
-      const dashDuration = play.dash.duration ||
-        page?.duration ||
-        view.duration ||
-        0;
-      const manifestXml = buildDashManifest({
-        duration: dashDuration,
-        minBufferTime: play.dash.minBufferTime,
-        video: videoTrack,
-        audio: audioTrack,
-        videoUrl,
-        audioUrl,
-      });
-      const manifestUrl = rememberDashManifest(manifestXml);
-      const availableQualities = listAvailableQualities(play.dash);
-
-      data = {
-        ...baseData,
-        mode: 'dash',
-        manifest: {
-          url: manifestUrl,
-          mime: 'application/dash+xml',
-        },
-        quality: videoTrack.id,
-        qualityLabel: qualityLabel(videoTrack.id),
-        qualityLocked: requestedQn > 64,
-        availableQualities,
-        acceptQuality: play.acceptQuality,
-        acceptDescription: play.acceptDescription,
-        dashDuration: Number(dashDuration) || 0,
-        format: 'dash',
-      };
+    if (parsed.kind === 'pgc' || loggedIn) {
+      data = buildDashPlayData({ baseData, play, qn, requestedQn });
     } else {
-      const segment = play.segments?.[0];
-      if (!segment) throw new Error('B 站没有返回可播放的视频流');
-      const availableQualities = [
-        ...new Set([play.quality, ...play.acceptQuality]),
-      ]
-        .filter(
-          (quality) =>
-            quality > 0 &&
-            (SUPPORTED_QN.has(quality) || quality === play.quality),
-        )
-        .sort((a, b) => b - a)
-        .map((quality) => ({ qn: quality, label: qualityLabel(quality) }));
-
-      data = {
-        ...baseData,
-        mode: 'mp4',
-        stream: {
-          url: rememberStream(segment.url, 'video/mp4'),
-          size: segment.size,
-          durationMs: segment.durationMs,
-        },
-        quality: play.quality,
-        qualityLabel: qualityLabel(play.quality),
-        qualityLocked: requestedQn > 64,
-        availableQualities,
-        acceptQuality: play.acceptQuality,
-        acceptDescription: play.acceptDescription,
-        format: play.format,
-      };
+      data = buildMp4PlayData({ baseData, play, requestedQn });
     }
 
     // A failed danmaku fetch should not pin playback to an empty comment list
@@ -649,7 +720,75 @@ export function apply(ctx, config = {}) {
             return;
           }
 
-          const bvid = normalizeBvid(body?.bvid);
+          const parsedKey = parseContentKey(
+            typeof body?.contentKey === 'string' ? body.contentKey : '',
+          );
+          // contentKey is authoritative; the explicit kind is the fallback for
+          // older callers, and presence of epid is the final legacy hint.
+          const kind =
+            parsedKey?.kind ||
+            (body?.kind === 'pgc' || body?.kind === 'ugc'
+              ? body.kind
+              : '') ||
+            (body?.epid ? 'pgc' : 'ugc');
+
+          const playedTime = clampInt(body?.playedTime, 0, 0, 86_400);
+          const realPlayedTime = clampInt(
+            body?.realPlayedTime,
+            playedTime,
+            0,
+            86_400,
+          );
+          const startTs = clampInt(body?.startTs, 0, 0, 4_000_000_000);
+          const event = ['start', 'heartbeat', 'pause', 'end', 'close'].includes(
+            body?.event,
+          )
+            ? body.event
+            : 'heartbeat';
+
+          if (kind === 'pgc') {
+            const epid =
+              normalizeEpid(body?.epid) ||
+              (parsedKey?.kind === 'pgc' ? parsedKey.epid : 0);
+            const seasonId = normalizeCid(body?.sid ?? body?.seasonId);
+            const cid = normalizeCid(body?.cid);
+            if (!epid || !seasonId || !cid) {
+              sendJson(res, 200, {
+                ok: true,
+                synced: false,
+                skipped: 'invalid',
+              });
+              return;
+            }
+
+            try {
+              await reportPgcHistory({
+                cookies: session.cookies,
+                epid,
+                seasonId,
+                cid,
+                aid: Number(body?.aid) || 0,
+                progress: playedTime,
+                startTs,
+                realPlayedTime,
+                event,
+              });
+              sendJson(res, 200, { ok: true, synced: true });
+            } catch (error) {
+              // Playback must never be interrupted by a history write failure.
+              ctx.logger?.warn?.(
+                `[bili-mini] pgc history sync skipped: ${
+                  redact(error?.message || error)
+                }`,
+              );
+              sendJson(res, 200, { ok: true, synced: false });
+            }
+            return;
+          }
+
+          const bvid =
+            normalizeBvid(body?.bvid) ||
+            (parsedKey?.kind === 'ugc' ? parsedKey.bvid : '');
           const aid = Number(body?.aid);
           const cid = normalizeCid(body?.cid);
           if (
@@ -665,20 +804,6 @@ export function apply(ctx, config = {}) {
             });
             return;
           }
-
-          const playedTime = clampInt(body?.playedTime, 0, 0, 86_400);
-          const realPlayedTime = clampInt(
-            body?.realPlayedTime,
-            playedTime,
-            0,
-            86_400,
-          );
-          const startTs = clampInt(body?.startTs, 0, 0, 4_000_000_000);
-          const event = ['start', 'heartbeat', 'pause', 'end', 'close'].includes(
-            body?.event,
-          )
-            ? body.event
-            : 'heartbeat';
 
           try {
             await reportVideoHistory({
@@ -710,9 +835,39 @@ export function apply(ctx, config = {}) {
             return;
           }
 
-          const bvid = normalizeBvid(url.searchParams.get('bvid'));
-          if (!bvid) {
-            sendJson(res, 400, { ok: false, error: 'invalid bvid' });
+          const rawContentKey = url.searchParams.get('contentKey');
+          const rawBvid = url.searchParams.get('bvid');
+          const rawEpid = url.searchParams.get('epid');
+
+          let requested = null;
+          if (rawContentKey !== null) {
+            requested = parseContentKey(rawContentKey);
+          } else if (rawBvid !== null) {
+            const bvid = normalizeBvid(rawBvid);
+            if (bvid) {
+              requested = { kind: 'ugc', bvid, contentKey: bvid };
+            }
+          } else if (rawEpid !== null) {
+            const epid = normalizeEpid(rawEpid);
+            if (epid) {
+              requested = {
+                kind: 'pgc',
+                epid,
+                contentKey: `pgc:${epid}`,
+              };
+            }
+          }
+
+          if (!requested) {
+            const error =
+              rawContentKey !== null
+                ? 'invalid contentKey'
+                : rawBvid !== null
+                  ? 'invalid bvid'
+                  : rawEpid !== null
+                    ? 'invalid epid'
+                    : 'invalid contentKey';
+            sendJson(res, 400, { ok: false, error });
             return;
           }
 
@@ -724,13 +879,18 @@ export function apply(ctx, config = {}) {
           const requestedQn = normalizeQn(url.searchParams.get('qn'));
           const qn = loggedIn ? requestedQn : 64;
           const sessionKey = cookieSessionKey(cookies);
-          const data = await loadPlay(bvid, requestedCid, force, {
-            qn,
-            requestedQn,
-            cookies,
-            loggedIn,
-            sessionKey,
-          });
+          const data = await loadPlay(
+            requested.contentKey,
+            requestedCid,
+            force,
+            {
+              qn,
+              requestedQn,
+              cookies,
+              loggedIn,
+              sessionKey,
+            },
+          );
           // These fields describe this request, not the cached play record.
           sendJson(res, 200, {
             ok: true,
@@ -914,6 +1074,16 @@ function sendJson(res, status, body) {
 function normalizeBvid(value) {
   const text = String(value ?? '').trim();
   return /^BV[0-9A-Za-z]{10}$/.test(text) ? text : '';
+}
+
+/** PGC episode ids are positive integers; reject floats/exponents. */
+function normalizeEpid(value) {
+  const text = typeof value === 'number'
+    ? String(value)
+    : String(value ?? '').trim();
+  if (!/^\d{1,20}$/.test(text)) return 0;
+  const n = Number(text);
+  return Number.isSafeInteger(n) && n > 0 ? n : 0;
 }
 
 function normalizeCid(value) {

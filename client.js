@@ -69,6 +69,8 @@ window.__ModuleLoader__.load({
         historySync: '同步历史',
         historySyncOn: '同步历史：开',
         historySyncOff: '同步历史：关',
+        episodes: '选集',
+        autoNext: '自动连播',
         quality: '画质',
         loginToUnlock: '登录后解锁',
       },
@@ -120,6 +122,8 @@ window.__ModuleLoader__.load({
         historySync: 'Sync history',
         historySyncOn: 'Sync history: on',
         historySyncOff: 'Sync history: off',
+        episodes: 'Episodes',
+        autoNext: 'Autoplay next',
         quality: 'Quality',
         loginToUnlock: 'sign in to unlock',
       },
@@ -222,6 +226,25 @@ window.__ModuleLoader__.load({
       } catch {
         return '';
       }
+    }
+
+    /**
+     * Resolve the canonical playback key for a feed/history/play record.
+     * Mirrors the host: UGC uses the bare bvid, PGC uses `pgc:<epid>`.
+     * The fallbacks keep old panel-memory records and mixed server responses
+     * usable without a full page reload.
+     */
+    function contentKeyOf(item) {
+      const explicit =
+        typeof item?.contentKey === 'string' ? item.contentKey.trim() : '';
+      if (explicit) return explicit;
+
+      const bvid = typeof item?.bvid === 'string' ? item.bvid.trim() : '';
+      if (/^BV[0-9A-Za-z]{10}$/.test(bvid)) return bvid;
+
+      const epid = Number(item?.epid);
+      if (Number.isSafeInteger(epid) && epid > 0) return `pgc:${epid}`;
+      return '';
     }
 
     /**
@@ -407,7 +430,10 @@ window.__ModuleLoader__.load({
 
     /** Resolve a playable stream + metadata for one card. */
     async function requestPlay(video, force, signal, qn = 64) {
-      const params = new URLSearchParams({ bvid: video.bvid });
+      const contentKey = contentKeyOf(video);
+      if (!contentKey) throw new Error('缺少播放标识');
+
+      const params = new URLSearchParams({ contentKey });
       if (video.cid) params.set('cid', String(video.cid));
       params.set('qn', String(qn));
       if (force) params.set('refresh', '1');
@@ -696,6 +722,9 @@ window.__ModuleLoader__.load({
       quality,
       availableQualities,
       onQualityChange,
+      onSelectEpisode,
+      autoNext = true,
+      onToggleAutoNext,
       qualityBusy = false,
     }) {
       const stageRef = React.useRef(null);
@@ -704,7 +733,14 @@ window.__ModuleLoader__.load({
       const [playerReady, setPlayerReady] = React.useState(false);
       const [artError, setArtError] = React.useState('');
       const [danmakuError, setDanmakuError] = React.useState('');
+      const [episodesOpen, setEpisodesOpen] = React.useState(false);
       const mode = play.data?.mode === 'dash' ? 'dash' : 'mp4';
+      const contentKey = contentKeyOf(play.data) || contentKeyOf(video);
+      const isPgc =
+        play.data?.kind === 'pgc' ||
+        video.kind === 'pgc' ||
+        contentKey.toLowerCase().startsWith('pgc:');
+      const kind = isPgc ? 'pgc' : 'ugc';
       const source =
         mode === 'dash'
           ? play.data?.manifest?.url
@@ -717,6 +753,53 @@ window.__ModuleLoader__.load({
       const failed = play.status === 'error' || (play.status === 'ready' && Boolean(artError));
       const errorText = play.status === 'error' ? play.error : artError;
       const danmakuNote = play.data?.danmakuError || danmakuError;
+      const episodes = Array.isArray(play.data?.episodes)
+        ? play.data.episodes
+        : [];
+      const currentEpisodeKey = contentKeyOf(play.data) || contentKey;
+      const currentEpisodeIndex = episodes.findIndex(
+        (episode) => contentKeyOf(episode) === currentEpisodeKey,
+      );
+
+      /**
+       * Reuse startPlay() for an episode switch. The new object carries the
+       * same shape as a history card, so the existing contentKey request and
+       * progress-reporting paths need no special cases.
+       */
+      const selectEpisode = React.useCallback(
+        (episode) => {
+          if (!episode) return;
+          const nextKey = contentKeyOf(episode);
+          setEpisodesOpen(false);
+          if (!nextKey || nextKey === currentEpisodeKey) return;
+
+          onSelectEpisode?.({
+            kind: 'pgc',
+            contentKey: nextKey,
+            epid: episode.epid,
+            seasonId: play.data?.seasonId || video.seasonId,
+            cid: episode.cid,
+            title:
+              [play.data?.seasonTitle, episode.title]
+                .filter(Boolean)
+                .join(' · ') ||
+              episode.title ||
+              `EP ${episode.epid}`,
+            cover: play.data?.cover || video.cover,
+            duration: Number(episode.duration) || 0,
+            url: `https://www.bilibili.com/bangumi/play/ep${episode.epid}`,
+          });
+        },
+        [
+          currentEpisodeKey,
+          onSelectEpisode,
+          play.data?.cover,
+          play.data?.seasonId,
+          play.data?.seasonTitle,
+          video.cover,
+          video.seasonId,
+        ],
+      );
 
       React.useEffect(() => {
         setPlayerReady(false);
@@ -872,7 +955,12 @@ window.__ModuleLoader__.load({
         const bvid = play.data?.bvid || video.bvid;
         const aid = Number(play.data?.aid) || 0;
         const cid = Number(play.data?.cid) || Number(video.cid) || 0;
-        if (!bvid || !aid || !cid) return;
+        const epid = Number(play.data?.epid) || Number(video.epid) || 0;
+        const seasonId =
+          Number(play.data?.seasonId) || Number(video.seasonId) || 0;
+        if (!contentKey || !cid) return;
+        if (kind === 'ugc' && (!bvid || !aid)) return;
+        if (kind === 'pgc' && (!epid || !seasonId)) return;
 
         const startedEpoch = Math.floor(Date.now() / 1000);
         let startedAt = 0;
@@ -901,19 +989,35 @@ window.__ModuleLoader__.load({
               duration || 86_400,
             ),
           );
+          const payload = kind === 'pgc'
+            ? {
+                kind: 'pgc',
+                contentKey,
+                epid,
+                sid: seasonId,
+                cid,
+                ...(aid > 0 ? { aid } : {}),
+                playedTime: played,
+                duration,
+                realPlayedTime: played,
+                startTs: startedAt || startedEpoch,
+                event,
+              }
+            : {
+                bvid,
+                aid,
+                cid,
+                playedTime: played,
+                duration,
+                realPlayedTime: played,
+                startTs: startedAt || startedEpoch,
+                event,
+              };
+
           fetch('/bili-mini/api/history/report', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              bvid,
-              aid,
-              cid,
-              playedTime: played,
-              duration,
-              realPlayedTime: played,
-              startTs: startedAt || startedEpoch,
-              event,
-            }),
+            body: JSON.stringify(payload),
             keepalive,
           }).catch(() => {
             // Silent by design: history sync must never disturb playback.
@@ -1007,13 +1111,61 @@ window.__ModuleLoader__.load({
         syncHistory,
         playerReady,
         url,
+        kind,
+        contentKey,
         play.data?.aid,
         play.data?.bvid,
         play.data?.cid,
         play.data?.duration,
+        play.data?.epid,
+        play.data?.seasonId,
         video.bvid,
         video.cid,
         video.duration,
+        video.epid,
+        video.seasonId,
+      ]);
+
+      // Auto-play the next episode after the current one ends. The existing
+      // progress reporter also listens for `ended`; a short delay lets its
+      // final report leave before the player is replaced.
+      React.useEffect(() => {
+        if (!isPgc || !autoNext || episodes.length < 2 || !playerReady || !url) {
+          return;
+        }
+
+        const art = artRef.current;
+        const element =
+          art?.video || stageRef.current?.querySelector('video');
+        if (!element) return;
+
+        let timer = null;
+        const onEnded = () => {
+          const index = episodes.findIndex(
+            (episode) => contentKeyOf(episode) === currentEpisodeKey,
+          );
+          const next = index >= 0 ? episodes[index + 1] : null;
+          if (!next) return;
+
+          timer = setTimeout(() => {
+            timer = null;
+            selectEpisode(next);
+          }, 350);
+        };
+
+        element.addEventListener('ended', onEnded);
+        return () => {
+          element.removeEventListener('ended', onEnded);
+          if (timer) clearTimeout(timer);
+        };
+      }, [
+        autoNext,
+        currentEpisodeKey,
+        episodes,
+        isPgc,
+        playerReady,
+        selectEpisode,
+        url,
       ]);
 
       const qualityOptions = [];
@@ -1028,6 +1180,16 @@ window.__ModuleLoader__.load({
       const currentQuality =
         Number(quality) || Number(play.data?.quality) || 64;
 
+      // Anonymous PGC is normally 480P. The host already returns the current
+      // quality as a fallback, but adding it explicitly keeps the label/locked
+      // state correct even when the track list omits qn=32.
+      if (isPgc && currentQuality === 32) {
+        qualityOptions.push({
+          qn: 32,
+          label: play.data?.qualityLabel || '480P',
+          locked: false,
+        });
+      }
       if (availableMap.has(64)) {
         qualityOptions.push({ qn: 64, label: availableMap.get(64), locked: false });
       }
@@ -1060,6 +1222,27 @@ window.__ModuleLoader__.load({
           h(
             'div',
             { className: 'bili-mini-player-head-actions' },
+            isPgc && episodes.length > 1
+              ? h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: `bili-mini-episodes-toggle${
+                      episodesOpen ? ' is-open' : ''
+                    }`,
+                    onClick: () => setEpisodesOpen((open) => !open),
+                    title: t('episodes'),
+                    'aria-label': t('episodes'),
+                    'aria-expanded': episodesOpen,
+                    'aria-controls': 'bili-mini-episodes-panel',
+                  },
+                  currentEpisodeIndex >= 0
+                    ? `${t('episodes')} ${currentEpisodeIndex + 1}/${
+                        episodes.length
+                      }`
+                    : `${t('episodes')} (${episodes.length})`,
+                )
+              : null,
             h(
               'select',
               {
@@ -1188,6 +1371,65 @@ window.__ModuleLoader__.load({
               )
             : null,
         ),
+        isPgc && episodesOpen && episodes.length > 0
+          ? h(
+              'div',
+              {
+                className: 'bili-mini-episodes',
+                id: 'bili-mini-episodes-panel',
+                role: 'region',
+                'aria-label': t('episodes'),
+              },
+              h(
+                'div',
+                { className: 'bili-mini-episodes-head' },
+                h(
+                  'span',
+                  { className: 'bili-mini-episodes-title' },
+                  currentEpisodeIndex >= 0
+                    ? `${t('episodes')} ${currentEpisodeIndex + 1}/${
+                        episodes.length
+                      }`
+                    : `${t('episodes')} (${episodes.length})`,
+                ),
+                episodes.length > 1
+                  ? h(
+                      'label',
+                      { className: 'bili-mini-auto-next' },
+                      h('input', {
+                        type: 'checkbox',
+                        checked: autoNext,
+                        onChange: (event) =>
+                          onToggleAutoNext?.(event.target.checked),
+                      }),
+                      h('span', null, t('autoNext')),
+                    )
+                  : null,
+              ),
+              h(
+                'div',
+                { className: 'bili-mini-episodes-grid' },
+                episodes.map((episode) => {
+                  const active =
+                    contentKeyOf(episode) === currentEpisodeKey;
+                  return h(
+                    'button',
+                    {
+                      type: 'button',
+                      key: contentKeyOf(episode) || String(episode.epid),
+                      className: `bili-mini-episode${
+                        active ? ' is-active' : ''
+                      }`,
+                      title: episode.title || `EP ${episode.epid}`,
+                      'aria-current': active ? 'true' : undefined,
+                      onClick: () => selectEpisode(episode),
+                    },
+                    episode.title || `EP ${episode.epid}`,
+                  );
+                }),
+              ),
+            )
+          : null,
         h(
           'div',
           { className: 'bili-mini-player-meta' },
@@ -1399,6 +1641,7 @@ window.__ModuleLoader__.load({
       const [syncHistory, setSyncHistory] = React.useState(
         loadHistorySyncSetting,
       );
+      const [autoNext, setAutoNext] = React.useState(true);
       const initialQuality =
         initialPlayback?.quality ||
         initialPlayback?.play?.data?.quality ||
@@ -1495,7 +1738,7 @@ window.__ModuleLoader__.load({
         qualityAbortRef.current = null;
         setQualityBusy(false);
 
-        if (selectedRef.current?.bvid !== video.bvid) {
+        if (contentKeyOf(selectedRef.current) !== contentKeyOf(video)) {
           playTimeRef.current = 0;
           setResumeAt(0);
           panelMemory.playback = null;
@@ -1843,6 +2086,8 @@ window.__ModuleLoader__.load({
               ? t('errorSub')
               : t('loadingSub');
 
+      const selectedKey = contentKeyOf(selected);
+
       let content;
       if (view === 'history') {
         if (history.status === 'loading' || history.status === 'idle') {
@@ -1887,8 +2132,8 @@ window.__ModuleLoader__.load({
             history.items.map((item) =>
               h(Card, {
                 item,
-                key: item.bvid,
-                active: selected?.bvid === item.bvid,
+                key: contentKeyOf(item),
+                active: selectedKey === contentKeyOf(item),
                 onSelect: startPlay,
               }),
             ),
@@ -1931,8 +2176,8 @@ window.__ModuleLoader__.load({
           state.items.map((item) =>
             h(Card, {
               item,
-              key: item.bvid,
-              active: selected?.bvid === item.bvid,
+              key: contentKeyOf(item),
+              active: selectedKey === contentKeyOf(item),
               onSelect: startPlay,
             }),
           ),
@@ -2083,7 +2328,7 @@ window.__ModuleLoader__.load({
           ),
           selected
             ? h(PlayerSection, {
-                key: selected.bvid,
+                key: selectedKey || selected.url || 'bili-mini-player',
                 video: selected,
                 play,
                 onClose: closePlayer,
@@ -2097,6 +2342,9 @@ window.__ModuleLoader__.load({
                 quality: play.data?.quality || quality,
                 availableQualities: play.data?.availableQualities || [],
                 onQualityChange: switchQuality,
+                onSelectEpisode: startPlay,
+                autoNext,
+                onToggleAutoNext: setAutoNext,
                 qualityBusy,
               })
             : null,
@@ -2382,6 +2630,9 @@ window.__ModuleLoader__.load({
 .bili-mini-player-close:focus-visible,
 .bili-mini-sync:focus-visible,
 .bili-mini-quality:focus-visible,
+.bili-mini-episodes-toggle:focus-visible,
+.bili-mini-episode:focus-visible,
+.bili-mini-auto-next input:focus-visible,
 .bili-mini-player-action:focus-visible,
 .bili-mini-player-link:focus-visible,
 .bili-mini-login:focus-visible,
@@ -2476,6 +2727,97 @@ window.__ModuleLoader__.load({
 }
 .bili-mini-quality option:disabled {
   color: #9aa0a6;
+}
+.bili-mini-episodes-toggle {
+  flex: none;
+  height: 24px;
+  padding: 0 8px;
+  overflow: hidden;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12));
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, #5c636b);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bili-mini-episodes-toggle:hover,
+.bili-mini-episodes-toggle.is-open {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, 0.05));
+  color: var(--dsw-alias-label-primary, #1f2329);
+}
+.bili-mini-episodes {
+  max-width: 860px;
+  margin: 8px auto 0;
+  padding: 8px;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12));
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-2, rgba(0, 0, 0, 0.04));
+}
+.bili-mini-episodes-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+  color: var(--dsw-alias-label-tertiary, #8a9099);
+  font-size: 11px;
+}
+.bili-mini-episodes-title {
+  overflow: hidden;
+  color: var(--dsw-alias-label-secondary, #5c636b);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bili-mini-auto-next {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+.bili-mini-auto-next input {
+  margin: 0;
+  accent-color: var(--dsw-alias-brand-primary, #00aeec);
+  cursor: pointer;
+}
+.bili-mini-episodes-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 6px;
+  max-height: 168px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.bili-mini-episode {
+  min-width: 0;
+  height: 28px;
+  padding: 0 8px;
+  overflow: hidden;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12));
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, #5c636b);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bili-mini-episode:hover {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, 0.05));
+  color: var(--dsw-alias-label-primary, #1f2329);
+}
+.bili-mini-episode.is-active {
+  border-color: var(--dsw-alias-brand-primary, #00aeec);
+  background: rgba(0, 174, 236, 0.12);
+  color: var(--dsw-alias-brand-primary, #00aeec);
+  font-weight: 600;
 }
 .bili-mini-player-close {
   display: inline-flex;
