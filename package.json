@@ -1,6 +1,6 @@
 {
   "name": "dsh-bili-mini",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "main": "./index.js",
   "description": "BiliMini — a geeky Bilibili sidebar for DeepSeek Harness (DSH) with DASH 1080P, danmaku and local QR login.",
