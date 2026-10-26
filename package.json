@@ -17,6 +17,7 @@
     "bili.js",
     "danmaku.js",
     "auth.js",
+    "trust.js",
     "client.js",
     "cordis.patch.yml",
     "locale/*.json",
@@ -61,7 +62,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "check": "node --check index.js && node --check bili.js && node --check auth.js && node --check danmaku.js && node --check client.js",
+    "check": "node --check index.js && node --check bili.js && node --check auth.js && node --check trust.js && node --check danmaku.js && node --check client.js",
     "prepublishOnly": "npm run check"
   },
   "publishConfig": {

@@ -6,6 +6,9 @@ data/
 cookie.json
 *.tmp
 
+# local audit/test scripts (not shipped)
+test-trust.js
+
 # OS / editor clutter
 .DS_Store
 Thumbs.db

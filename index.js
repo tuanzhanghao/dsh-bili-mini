@@ -9,8 +9,10 @@
  *                                              play metadata + proxied stream + danmaku
  *                                              (legacy ?bvid=... and ?epid=... still work)
  *   GET  /bili-mini/stream/<token>            range-aware media proxy
- *   GET  /bili-mini/api/login/qr              Bilibili QR code + qrcode_key
- *   GET  /bili-mini/api/login/poll?key=...    scan status (writes cookie on success)
+ *   GET  /bili-mini/api/login/qr              Bilibili QR image + local sessionToken
+ *   GET  /bili-mini/api/login/poll?sessionToken=...
+ *                                             scan status (qrcode_key stays in Host)
+ *   POST /bili-mini/api/login/cancel          destroy a local QR session
  *   GET  /bili-mini/api/login/status          local login state
  *   DELETE /bili-mini/api/login               remove data/cookie.json
  *   GET  /bili-mini/vendor/artplayer.js       vendored player bundle
@@ -49,6 +51,7 @@ import {
   pollQr,
   redact,
 } from './auth.js';
+import { isTrustedLoopbackRequest, isTrustedRequest } from './trust.js';
 
 export const name = 'dsh-bili-mini';
 export const inject = ['webServer'];
@@ -61,6 +64,8 @@ const MAX_STREAMS = 200;
 const MAX_DASH_MANIFESTS = 100;
 const MAX_PLAY_CACHE = 100;
 const CONNECT_TIMEOUT_MS = 15_000;
+const LOGIN_SESSION_TTL_MS = 3 * 60_000;
+const MAX_LOGIN_SESSIONS = 32;
 
 const QUALITY_LABELS = new Map([
   [120, '4K'],
@@ -109,6 +114,72 @@ export function apply(ctx, config = {}) {
   const playCache = new Map();
   /** Opaque manifest tokens -> generated MPD XML. */
   const dashManifests = new Map();
+  /** Random login session token -> Bilibili qrcode_key + local expiry. */
+  const loginSessions = new Map();
+
+  function deleteLoginSession(token) {
+    const entry = loginSessions.get(token);
+    if (!entry) return false;
+    if (entry.timer) clearTimeout(entry.timer);
+    loginSessions.delete(token);
+    return true;
+  }
+
+  function pruneLoginSessions(now = Date.now()) {
+    for (const [token, entry] of loginSessions) {
+      if (entry.expiresAt <= now) deleteLoginSession(token);
+    }
+    while (loginSessions.size >= MAX_LOGIN_SESSIONS) {
+      const oldest = loginSessions.keys().next().value;
+      if (oldest === undefined) break;
+      deleteLoginSession(oldest);
+    }
+  }
+
+  function createLoginSession(qrcodeKey, expiresIn) {
+    if (typeof qrcodeKey !== 'string' || !qrcodeKey) {
+      throw new Error('missing qrcode key');
+    }
+    pruneLoginSessions();
+    const token = randomUUID();
+    const seconds = clampInt(
+      expiresIn,
+      LOGIN_SESSION_TTL_MS / 1000,
+      30,
+      600,
+    );
+    const entry = {
+      qrcodeKey,
+      expiresAt: Date.now() + seconds * 1000,
+      timer: null,
+    };
+    // Delete even if the panel never polls again. unref() keeps the timer from
+    // holding a test/CLI process open.
+    entry.timer = setTimeout(() => {
+      loginSessions.delete(token);
+    }, seconds * 1000);
+    entry.timer.unref?.();
+    loginSessions.set(token, entry);
+    return token;
+  }
+
+  function readLoginSession(token) {
+    if (
+      typeof token !== 'string' ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+        token,
+      )
+    ) {
+      return { error: 'invalid' };
+    }
+    const entry = loginSessions.get(token);
+    if (!entry) return { error: 'invalid' };
+    if (entry.expiresAt <= Date.now()) {
+      deleteLoginSession(token);
+      return { error: 'expired' };
+    }
+    return { entry };
+  }
 
   async function loadFeed(force = false) {
     const session = loadSession();
@@ -635,6 +706,22 @@ export function apply(ctx, config = {}) {
     handler: async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
 
+      // Media/manifest URLs carry an unguessable capability token; vendored
+      // player scripts are public assets. Browsers attach different Origin /
+      // Sec-Fetch-Site metadata to <video>/<script> loads, so these routes use
+      // the Host-only fence. API routes keep the full Origin fence.
+      const loopbackOnly =
+        url.pathname.startsWith(`${PREFIX}/stream/`) ||
+        url.pathname.startsWith(`${PREFIX}/dash/`) ||
+        url.pathname.startsWith(`${PREFIX}/vendor/`);
+      const trusted = loopbackOnly
+        ? isTrustedLoopbackRequest(req)
+        : isTrustedRequest(req);
+      if (!trusted) {
+        sendJson(res, 403, { ok: false, error: 'forbidden' });
+        return;
+      }
+
       try {
         if (url.pathname === `${PREFIX}/api/feed`) {
           if (req.method !== 'GET') {
@@ -926,7 +1013,15 @@ export function apply(ctx, config = {}) {
             return;
           }
           const qr = await generateQr();
-          sendJson(res, 200, { ok: true, ...qr });
+          const sessionToken = createLoginSession(qr.key, qr.expiresIn);
+          // The Bilibili qrcode_key stays in the Host. The browser only gets
+          // an opaque token that is useless without the local session map.
+          sendJson(res, 200, {
+            ok: true,
+            sessionToken,
+            image: qr.image,
+            expiresIn: qr.expiresIn,
+          });
           return;
         }
 
@@ -935,13 +1030,86 @@ export function apply(ctx, config = {}) {
             sendJson(res, 405, { ok: false, error: 'method not allowed' });
             return;
           }
-          const key = url.searchParams.get('key') || '';
-          if (!/^[A-Za-z0-9_-]{16,128}$/.test(key)) {
-            sendJson(res, 400, { ok: false, error: 'invalid key' });
+
+          const sessionToken = url.searchParams.get('sessionToken') || '';
+          const session = readLoginSession(sessionToken);
+          if (!session.entry) {
+            const expired = session.error === 'expired';
+            sendJson(res, 403, {
+              ok: false,
+              error: expired
+                ? 'login session expired'
+                : 'invalid login session',
+              code: expired ? 'session_expired' : 'invalid_session',
+            });
             return;
           }
-          const result = await pollQr(key);
+
+          // A caller that still sends the legacy `key` must not be able to
+          // poll a different QR than the one this token was created for.
+          const suppliedKey = url.searchParams.get('key');
+          if (suppliedKey !== null && suppliedKey !== session.entry.qrcodeKey) {
+            deleteLoginSession(sessionToken);
+            sendJson(res, 403, {
+              ok: false,
+              error: 'login session mismatch',
+              code: 'invalid_session',
+            });
+            return;
+          }
+
+          let result;
+          try {
+            result = await pollQr(session.entry.qrcodeKey);
+          } catch (error) {
+            // The UI stops polling on an upstream failure; do not leave an
+            // orphaned local session behind.
+            deleteLoginSession(sessionToken);
+            throw error;
+          }
+
+          if (
+            result.status === 'success' ||
+            result.status === 'expired' ||
+            result.status === 'error'
+          ) {
+            deleteLoginSession(sessionToken);
+          }
           sendJson(res, 200, { ok: true, ...result });
+          return;
+        }
+
+        if (url.pathname === `${PREFIX}/api/login/cancel`) {
+          if (req.method !== 'POST') {
+            sendJson(res, 405, { ok: false, error: 'method not allowed' });
+            return;
+          }
+          if (
+            !String(req.headers['content-type'] || '').includes(
+              'application/json',
+            )
+          ) {
+            sendJson(res, 415, {
+              ok: false,
+              error: 'unsupported media type',
+            });
+            return;
+          }
+
+          let body;
+          try {
+            body = await readJsonBody(req);
+          } catch {
+            sendJson(res, 400, { ok: false, error: 'invalid body' });
+            return;
+          }
+
+          if (typeof body?.sessionToken === 'string') {
+            deleteLoginSession(body.sessionToken);
+          }
+          // Idempotent and deliberately does not disclose whether the token
+          // existed: closing the modal must never become a token oracle.
+          sendJson(res, 200, { ok: true });
           return;
         }
 
@@ -958,6 +1126,9 @@ export function apply(ctx, config = {}) {
           if (req.method !== 'DELETE') {
             sendJson(res, 405, { ok: false, error: 'method not allowed' });
             return;
+          }
+          for (const token of [...loginSessions.keys()]) {
+            deleteLoginSession(token);
           }
           logout();
           sendJson(res, 200, { ok: true, loggedIn: false });

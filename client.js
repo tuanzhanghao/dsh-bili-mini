@@ -471,16 +471,35 @@ window.__ModuleLoader__.load({
       return body;
     }
 
-    async function fetchLoginPoll(key, signal) {
+    async function fetchLoginPoll(sessionToken, signal) {
       const response = await fetch(
-        `/bili-mini/api/login/poll?key=${encodeURIComponent(key)}`,
+        `/bili-mini/api/login/poll?sessionToken=${encodeURIComponent(
+          sessionToken,
+        )}`,
         { signal },
       );
       const body = await response.json().catch(() => null);
       if (!response.ok || !body?.ok) {
-        throw new Error(body?.error || `HTTP ${response.status}`);
+        const error = new Error(body?.error || `HTTP ${response.status}`);
+        error.code = body?.code || '';
+        throw error;
       }
       return body;
+    }
+
+    /** Best-effort local session cleanup after close/retry/unmount. */
+    async function cancelLoginSession(sessionToken) {
+      if (!sessionToken) return;
+      try {
+        await fetch('/bili-mini/api/login/cancel', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sessionToken }),
+          keepalive: true,
+        });
+      } catch {
+        // The Host also expires the token on its own TTL.
+      }
     }
 
     async function requestLogout() {
@@ -1619,6 +1638,7 @@ window.__ModuleLoader__.load({
       const loginTimerRef = React.useRef(null);
       const loginAbortRef = React.useRef(null);
       const loginOpenRef = React.useRef(false);
+      const loginTokenRef = React.useRef('');
       const [view, setView] = React.useState(
         () => panelMemory.view || 'feed',
       );
@@ -1927,7 +1947,8 @@ window.__ModuleLoader__.load({
         loginAbortRef.current = null;
       };
 
-      const scheduleLoginPoll = (key) => {
+      const scheduleLoginPoll = (sessionToken) => {
+        if (!sessionToken) return;
         if (loginTimerRef.current) clearTimeout(loginTimerRef.current);
         loginTimerRef.current = setTimeout(async () => {
           if (!loginOpenRef.current) return;
@@ -1937,15 +1958,20 @@ window.__ModuleLoader__.load({
           loginAbortRef.current = controller;
 
           try {
-            const body = await fetchLoginPoll(key, controller.signal);
+            const body = await fetchLoginPoll(
+              sessionToken,
+              controller.signal,
+            );
             if (!loginOpenRef.current || controller.signal.aborted) return;
 
             if (body.status === 'success') {
               stopLoginPolling();
+              loginTokenRef.current = '';
               loginOpenRef.current = false;
               setLoginOpen(false);
               setLoginState('idle');
               setLoginError('');
+              setQr(null);
               setUser(body.user || { mid: 0, name: t('loggedIn'), face: '' });
               panelMemory.feed = null;
               panelMemory.history = null;
@@ -1956,17 +1982,27 @@ window.__ModuleLoader__.load({
 
             if (body.status === 'expired' || body.status === 'error') {
               stopLoginPolling();
+              loginTokenRef.current = '';
               setLoginState(body.status);
               setLoginError(body.message || '');
               return;
             }
 
             setLoginState(body.status);
-            scheduleLoginPoll(key);
+            scheduleLoginPoll(sessionToken);
           } catch (error) {
             if (error.name === 'AbortError' || controller.signal.aborted) return;
             if (!loginOpenRef.current) return;
             stopLoginPolling();
+            if (error.code === 'session_expired') {
+              loginTokenRef.current = '';
+              setLoginState('expired');
+              setLoginError(error.message);
+              return;
+            }
+            if (error.code === 'invalid_session') {
+              loginTokenRef.current = '';
+            }
             setLoginState('error');
             setLoginError(error.message);
           }
@@ -1979,16 +2015,27 @@ window.__ModuleLoader__.load({
         setLoginState('loading');
         setLoginError('');
         setQr(null);
+
+        const previousToken = loginTokenRef.current;
+        loginTokenRef.current = '';
         stopLoginPolling();
+        if (previousToken) void cancelLoginSession(previousToken);
 
         const controller = new AbortController();
         loginAbortRef.current = controller;
         try {
           const body = await fetchLoginQr(controller.signal);
-          if (!loginOpenRef.current || controller.signal.aborted) return;
-          setQr({ key: body.key, image: body.image });
+          if (!loginOpenRef.current || controller.signal.aborted) {
+            // The user closed the modal while the QR request was in flight;
+            // destroy the Host-side session if one was still returned.
+            if (body?.sessionToken) void cancelLoginSession(body.sessionToken);
+            return;
+          }
+          if (!body?.sessionToken) throw new Error('登录会话初始化失败');
+          loginTokenRef.current = body.sessionToken;
+          setQr({ image: body.image });
           setLoginState('waiting');
-          scheduleLoginPoll(body.key);
+          scheduleLoginPoll(body.sessionToken);
         } catch (error) {
           if (error.name === 'AbortError' || controller.signal.aborted) return;
           if (!loginOpenRef.current) return;
@@ -2003,7 +2050,10 @@ window.__ModuleLoader__.load({
         setLoginState('idle');
         setLoginError('');
         setQr(null);
+        const token = loginTokenRef.current;
+        loginTokenRef.current = '';
         stopLoginPolling();
+        if (token) void cancelLoginSession(token);
       };
 
       const logout = async () => {
@@ -2042,6 +2092,9 @@ window.__ModuleLoader__.load({
         return () => {
           loginOpenRef.current = false;
           stopLoginPolling();
+          const token = loginTokenRef.current;
+          loginTokenRef.current = '';
+          if (token) void cancelLoginSession(token);
         };
       }, []);
 

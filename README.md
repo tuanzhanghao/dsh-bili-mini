@@ -55,7 +55,7 @@ BiliMini 是一个面向 [DeepSeek Harness](https://github.com/deepseek-ai/deeps
 | 🎚️ | DASH 720P/1080P | 登录态使用 DASH 独立音视频轨；播放器右上角切换画质，保留当前进度 |
 | 🎞️ | PGC 剧集 | 支持番剧/电视剧 DASH 播放；PGC 历史条目可直接点开，进度走剧集心跳上报 |
 | 🗂️ | 选集与连播 | 播放器右上角打开集数网格，当前集高亮；点击切集，可开关自动连播 |
-| 🔐 | 本地安全登录 | B 站扫码登录；`SESSDATA` / `bili_jct` 只存在 Host 本地，前端不可见 |
+| 🔐 | 本地安全登录 | B 站扫码登录；二维码轮询使用一次性本机会话 token；`SESSDATA` / `bili_jct` 只存在 Host 本地，前端不可见 |
 | ✨ | 个性化推荐 | 登录后自动带 Cookie 请求；退出后回退匿名推荐 |
 | 🕘 | 历史记录 | 最近 30 条观看记录，普通视频与 PGC 剧集混排，支持继续播放 |
 | 🔄 | 历史同步 | 按网页播放器的方式节流上报进度；UGC 与 PGC 分别走对应接口，可选关闭，失败静默 |
@@ -194,14 +194,18 @@ BiliMini 涉及 B 站账号 Cookie，边界如下：
 | Cookie 位置 | 仅本地 Host 的 `data/cookie.json`；不写前端 localStorage/sessionStorage |
 | POSIX 权限 | 数据目录 `0700`，Cookie 文件 `0600` |
 | Windows 权限 | 不调用 `chmod`，交由用户目录 ACL |
-| 前端可见性 | 前端只拿 `loggedIn`、昵称、头像；永远拿不到 `SESSDATA` / `bili_jct` |
+| 前端可见性 | 前端只拿 `loggedIn`、昵称、头像和一次性扫码 `sessionToken`；永远拿不到 `SESSDATA` / `bili_jct` |
 | 网络范围 | 带 Cookie 的请求只发往 `*.bilibili.com` |
+| 路由信任 | API 校验 Host 为 loopback、拒绝 `Sec-Fetch-Site: cross-site`、Origin/Referer 同源；`/stream/`、`/dash/`、`/vendor/` 只校验 loopback Host（媒体 token / 公开静态资源） |
 | 重定向 | `redirect: "error"`，避免 Cookie 被带到第三方 |
 | 二维码 | 后端本地生成，不使用第三方二维码服务 |
+| 扫码会话 | `/api/login/qr` 只下发随机 `sessionToken`；`/api/login/poll` 必须携带且与 Host 内存中的 `qrcode_key` 绑定；成功、过期或取消立即销毁 |
 | 日志 | 后端错误统一 `redact()`；第一方代码不打印 Cookie、SESSDATA 或接口原始响应 |
 | 媒体令牌 | 随机、短期、仅本地使用；不写入磁盘 |
 | 退出登录 | 删除 `data/cookie.json` 及临时文件 |
 | 版本管理 | `.gitignore` 已忽略 `data/`、`cookie.json`、`*.log`、`.env*`、`.dsh-ops/` |
+
+> 路由信任 fence 只回答“请求是否来自本机页面”，不是身份认证，不能替代登录/ownerAuth。API 路由使用完整 Host + Origin + Sec-Fetch-Site 校验；`/stream/`、`/dash/` 使用不可预测 token 作为能力凭证，`/vendor/` 是公开播放器资源，这两类只校验 loopback Host，避免 `<video>` / `<script>` 的 Fetch Metadata 差异误伤播放。封面与头像直接来自 B 站远程 URL，二维码是本地生成的 `data:` URL，都不经过插件路由。
 
 BiliMini 没有遥测、埋点、远程配置或第三方中转服务器。推荐、播放、弹幕、登录和历史同步都只在本机 DSH Host 与 B 站之间发生。
 
@@ -270,6 +274,7 @@ Bilibili API / CDN
 - `index.js`：Host 路由、推荐/UGC/PGC 播放/历史/登录 API、DASH MPD、流代理、CORS、缓存；
 - `bili.js`：B 站接口封装、DASH 轨道归一化、UGC/PGC 历史与进度上报；
 - `auth.js`：扫码登录、Cookie 原子写入、权限、脱敏；
+- `trust.js`：`/bili-mini` 路由的 Host / Origin / Sec-Fetch-Site 浏览器信任校验；
 - `danmaku.js`：弹幕 XML 解析与格式转换；
 - `client.js`：React 侧边栏 UI、ArtPlayer、dash.js、弹幕插件、PGC 选集/连播、面板状态缓存；
 - `vendor/`：ArtPlayer、artplayer-plugin-danmuku、dash.js、qrcode-generator 的内置版本。
@@ -294,6 +299,7 @@ dsh-bili-mini/
 ├── index.js
 ├── bili.js
 ├── auth.js
+├── trust.js
 ├── danmaku.js
 ├── client.js
 ├── locale/
@@ -322,6 +328,7 @@ dsh-bili-mini/
 node --check index.js
 node --check bili.js
 node --check auth.js
+node --check trust.js
 node --check danmaku.js
 node --check client.js
 
